@@ -49,17 +49,15 @@ class CausalSelfAttention(nn.Module):
         V = V.view(B,T,self.n_head,C // self.n_head).transpose(1,2) # (B,nh,T,hs)
 
         # Compute attention weights
-        weights = (Q @ K.transpose(-1,-2)) * (self.n_embd ** -.5) # (B,nh,T,T)
+        #weights = (Q @ K.transpose(-1,-2)) * (self.n_embd ** -.5) # (B,nh,T,T)
         # Apply causal mask
-        weights = weights.masked_fill(self.bias[:T,:T], float("-inf"))
-
+        #weights = weights.masked_fill(self.bias[:T,:T], float("-inf"))
         # Compute attention scores
-        scores = F.softmax(weights, dim=-1)
+        #scores = F.softmax(weights, dim=-1)# Multiply with the value matrix
+        #out = scores @ V # (B,nh,T,hs)
 
-        ### Optional: apply dropout here
-
-        # Multiply with the value matrix
-        out = scores @ V # (B,nh,T,hs)
+        # Call Flash Attention instead
+        out = F.scaled_dot_product_attention(query=Q, key=K, value=V, is_causal=True)
 
         # Concatenate all heads together
         out = out.transpose(1,2).contiguous().view(B,T,C) # (B,T,C)
@@ -189,6 +187,22 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+    def configure_optimizer(self, weight_decay: float, learning_rate: float):
+        # Start by collection all learnable parameters
+        param_dict = {name: param for name, param in self.named_parameters() if param.requires_grad}
+        # Apply weight decay to all 2D parameters, no weight decay otherwise
+        decay_params = [param for _,param in param_dict.items() if param.dim() >= 2]
+        no_decay_params = [param for _,param in param_dict.items() if param.dim() < 2]
+        grouped = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+        print(f"Number of weight decay params: {sum([param.numel() for param in decay_params])}")
+        print(f"Number of non-weight decay params: {sum([param.numel() for param in no_decay_params])}")
+
+        return torch.optim.AdamW(grouped, lr=learning_rate, betas=(.9,.95), eps=1e-8)
 
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B,T = x.shape
@@ -209,6 +223,9 @@ class GPT(nn.Module):
         # Compute loss if target is provided
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(x.view(B*T, -1), targets.view(B*T))
+            # Shift by 1 to predict the next token in the sequence
+            x_shift = x[:,:-1,:]
+            target_shift = targets[:,1:]
+            loss = F.cross_entropy(x_shift.reshape(B*(T-1), -1), target_shift.reshape(B*(T-1)))
 
         return self.lm_head(x), loss
